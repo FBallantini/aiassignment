@@ -1,0 +1,90 @@
+# codice che non so se funziona woooo
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score
+
+# -----------------------------
+# 1. Load Data
+# -----------------------------
+
+
+rates_df = pd.read_csv('/Users/lavin/intrates.csv', parse_dates=['date'])
+index_df = pd.read_csv('/Users/lavin/indexdata.csv', parse_dates=['Unnamed: 0'])
+index_df.rename(columns={index_df.columns[0]: 'date'}, inplace=True)
+
+# Merge on date
+df = pd.merge(index_df, rates_df[['date', '3M']], on='date', how='inner')
+df.set_index('date', inplace=True)
+      
+# -----------------------------
+# 2. Feature Engineering on 3M Yield
+# -----------------------------
+df['3M_lag1'] = df['3M'].shift(1)
+df['3M_lag2'] = df['3M'].shift(2)
+df['3M_diff'] = df['3M'].diff(1)
+df['3M_ma3'] = df['3M'].rolling(window=3).mean()
+df.dropna(inplace=True)
+
+# -----------------------------
+# 3. Prepare for Regression
+# -----------------------------
+features = ['3M_lag1', '3M_lag2', '3M_diff', '3M_ma3']
+sectors = [col for col in df.columns if col not in features + ['3M']]
+
+results = {}
+
+for sector in sectors:
+    X = df[features]
+    y = df[sector]
+
+    # Train/Test Split (80/20)
+    split_index = int(len(df) * 0.8)
+    X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+    y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+
+    # Linear Regression
+    lr = LinearRegression().fit(X_train, y_train)
+    pred_lr = lr.predict(X_test)
+
+    # Ridge Regression
+    ridge_cv = GridSearchCV(Ridge(), {'alpha': np.logspace(-3, 3, 20)}, cv=5)
+    ridge_cv.fit(X_train, y_train)
+    pred_ridge = ridge_cv.predict(X_test)
+
+    # Lasso Regression
+    lasso_cv = GridSearchCV(Lasso(max_iter=10000), {'alpha': np.logspace(-3, 3, 20)}, cv=5)
+    lasso_cv.fit(X_train, y_train)
+    pred_lasso = lasso_cv.predict(X_test)
+
+    # Save results
+    results[sector] = {
+        'Linear': (mean_squared_error(y_test, pred_lr), r2_score(y_test, pred_lr), lr.coef_),
+        'Ridge': (mean_squared_error(y_test, pred_ridge), r2_score(y_test, pred_ridge), ridge_cv.best_estimator_.coef_),
+        'Lasso': (mean_squared_error(y_test, pred_lasso), r2_score(y_test, pred_lasso), lasso_cv.best_estimator_.coef_)
+    }
+
+    # Plot predictions
+    plt.figure(figsize=(12, 5))
+    plt.plot(y_test.index, y_test, label='Actual')
+    plt.plot(y_test.index, pred_lr, label='Linear')
+    plt.plot(y_test.index, pred_ridge, label='Ridge')
+    plt.plot(y_test.index, pred_lasso, label='Lasso')
+    plt.title(f"{sector} — Predicted vs Actual")
+    plt.xlabel("Date")
+    plt.ylabel("Sector Index")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# -----------------------------
+# 4. Summary Output
+# -----------------------------
+for sector, models in results.items():
+    print(f"\n=== {sector} ===")
+    for model, (mse, r2, coef) in models.items():
+        print(f"{model}: MSE = {mse:.4f}, R² = {r2:.4f}")
