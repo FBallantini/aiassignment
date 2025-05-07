@@ -1,90 +1,140 @@
-# codice che non so se funziona woooo
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
 # -----------------------------
-# 1. Load Data
-# -----------------------------
 
-
-rates_df = pd.read_csv('/Users/lavin/intrates.csv', parse_dates=['date'])
-index_df = pd.read_csv('/Users/lavin/indexdata.csv', parse_dates=['Unnamed: 0'])
+rates_df_temp = pd.read_csv('/Users/lavin/intrates.csv')
+#rates_df_temp = rates_df_temp.dropna(subset='3M')
+index_df = pd.read_csv('/Users/lavin/indexdata.csv')
 index_df.rename(columns={index_df.columns[0]: 'date'}, inplace=True)
 
-# Merge on date
-df = pd.merge(index_df, rates_df[['date', '3M']], on='date', how='inner')
-df.set_index('date', inplace=True)
-      
-# -----------------------------
-# 2. Feature Engineering on 3M Yield
-# -----------------------------
-df['3M_lag1'] = df['3M'].shift(1)
-df['3M_lag2'] = df['3M'].shift(2)
-df['3M_diff'] = df['3M'].diff(1)
-df['3M_ma3'] = df['3M'].rolling(window=3).mean()
-df.dropna(inplace=True)
+
+
+# create data frames for each index
+
+stocks = ['XLK', 'XLF', 'XLU','XLY','XLP','XLE','XLI','XLV','XLB']
+
+datasets = {}
+
+for stock in stocks: 
+    datasets[stock] = index_df[index_df['Symbol'] == stock]
+    datasets[stock] = datasets[stock].iloc[::-1].reset_index(drop=True)
+
+
 
 # -----------------------------
-# 3. Prepare for Regression
+# 3. Feature Engineering
 # -----------------------------
-features = ['3M_lag1', '3M_lag2', '3M_diff', '3M_ma3']
-sectors = [col for col in df.columns if col not in features + ['3M']]
 
-results = {}
+#compute daily return
 
-for sector in sectors:
-    X = df[features]
-    y = df[sector]
+rates_df = rates_df_temp
 
-    # Train/Test Split (80/20)
-    split_index = int(len(df) * 0.8)
-    X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
-    y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+for stock in stocks:
+    datasets[stock]['Return']=datasets[stock]['Close'].pct_change()
+#    rates_df = rates_df[rates_df.iloc[:, 0].isin(datasets[stock].iloc[:, 0])].reset_index(drop=True)
 
-    # Linear Regression
-    lr = LinearRegression().fit(X_train, y_train)
-    pred_lr = lr.predict(X_test)
+rates_df = rates_df.dropna(subset='3M')
 
-    # Ridge Regression
-    ridge_cv = GridSearchCV(Ridge(), {'alpha': np.logspace(-3, 3, 20)}, cv=5)
-    ridge_cv.fit(X_train, y_train)
-    pred_ridge = ridge_cv.predict(X_test)
+#for stock in stocks:
+#    datasets[stock] = datasets[stock][datasets[stock][:,0].isin(rates_df.iloc[:,0])].reset_index(drop=True)
 
-    # Lasso Regression
-    lasso_cv = GridSearchCV(Lasso(max_iter=10000), {'alpha': np.logspace(-3, 3, 20)}, cv=5)
-    lasso_cv.fit(X_train, y_train)
-    pred_lasso = lasso_cv.predict(X_test)
+# drop int rate observations from dates not present in the index observations
 
-    # Save results
-    results[sector] = {
-        'Linear': (mean_squared_error(y_test, pred_lr), r2_score(y_test, pred_lr), lr.coef_),
-        'Ridge': (mean_squared_error(y_test, pred_ridge), r2_score(y_test, pred_ridge), ridge_cv.best_estimator_.coef_),
-        'Lasso': (mean_squared_error(y_test, pred_lasso), r2_score(y_test, pred_lasso), lasso_cv.best_estimator_.coef_)
-    }
 
-    # Plot predictions
-    plt.figure(figsize=(12, 5))
-    plt.plot(y_test.index, y_test, label='Actual')
-    plt.plot(y_test.index, pred_lr, label='Linear')
-    plt.plot(y_test.index, pred_ridge, label='Ridge')
-    plt.plot(y_test.index, pred_lasso, label='Lasso')
-    plt.title(f"{sector} — Predicted vs Actual")
-    plt.xlabel("Date")
-    plt.ylabel("Sector Index")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
+# take the 1st difference of int rates to capture their change
+
+
+
+rates_df = rates_df.drop(['2Y','10Y'], axis=1)
+rates_df['Difference'] = rates_df['3M'].diff()
+
+plt.plot(rates_df['Difference'])
+plt.show()
+
+
+# LINEAR REGRESSION
+
+lr_results = {}
+
+#X = rates_df['Difference']
+#y = datasets['XLK']['Return']
+
+for stock in stocks:
+    temp_df = pd.merge(datasets[stock], rates_df,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Difference', 'Return'], how = 'any')
+    X = temp_df['Difference'].to_frame()
+    y = temp_df['Return'].to_frame()
+   
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    lr_model = LinearRegression()
+    lr_model.fit(X_train, y_train)
+
+    lr_pred = lr_model.predict(X_test)
+    lr_mse = mean_squared_error(y_test, lr_pred)
+    lr_r2 = r2_score(y_test, lr_pred)
+
+    lr_results[stock] = {'lr_pred' : lr_pred, 'y_test' : y_test, 'lr_mse' : lr_mse, 'lr_r2' : lr_r2}
+
+    plt.plot(y_test.values)
+    plt.plot(lr_pred)
     plt.show()
 
-# -----------------------------
-# 4. Summary Output
-# -----------------------------
-for sector, models in results.items():
-    print(f"\n=== {sector} ===")
-    for model, (mse, r2, coef) in models.items():
-        print(f"{model}: MSE = {mse:.4f}, R² = {r2:.4f}")
+
+#RIDGE REGRESSION
+
+for stock in stocks:
+    temp_df = pd.merge(datasets[stock], rates_df,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Difference', 'Return'], how = 'any')
+    X = temp_df['Difference'].to_frame()
+    y = temp_df['Return'].to_frame()
+    alpha_values = {'alpha': np.logspace(-4, 4, 50)}
+    ridge = Ridge()
+
+    ridge_cv = GridSearchCV(estimator=ridge, param_grid=alpha_values, cv=5, scoring='neg_mean_squared_error')
+    ridge_cv.fit(X_train, y_train)
+
+    ridge_pred = ridge_cv.predict(X_test)
+    ridge_mse = mean_squared_error(y_test, ridge_pred)
+    ridge_r2 = r2_score(y_test, ridge_pred)
+
+    plt.plot(y_test.values)
+    plt.plot(ridge_pred)
+    plt.show()
+
+#LASS REGRESSION
+
+for stock in stocks:
+    temp_df = pd.merge(datasets[stock], rates_df,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Difference', 'Return'], how = 'any')
+    X = temp_df['Difference'].to_frame()
+    y = temp_df['Return'].to_frame()
+    lasso = Lasso(max_iter=10000)
+    lasso_cv = GridSearchCV(estimator=lasso, param_grid=alpha_values, cv=5, scoring='neg_mean_squared_error')
+    lasso_cv.fit(X_train, y_train)
+
+    lasso_pred = lasso_cv.predict(X_test)
+    lasso_mse = mean_squared_error(y_test, lasso_pred)
+    lasso_r2 = r2_score(y_test, lasso_pred)
+
+    plt.plot(y_test.values)
+    plt.plot(lasso_pred)
+    plt.show()
+
+
+print("\n=== Ridge Regression ===")
+print("Miglior parametro alpha:", ridge_cv.best_params_)
+print(f"MSE: {ridge_mse:.7f}, R²: {ridge_r2:.4f}")
+print("\n=== Linear Regression ===")
+print(f"MSE: {lr_mse:.7f}, R²: {lr_r2:.4f}")
+print("\n=== Lasso Regression ===")
+print("Miglior parametro alpha:", lasso_cv.best_params_)
+print(f"MSE: {lasso_mse:.7f}, R²: {lasso_r2:.4f}")
+
+
