@@ -1,0 +1,548 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import requests
+import time
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+
+# retrieving data on interest rates from the FRED database
+
+#RETRIEVING INTEREST RATE DATA FROM FRED DATABASE
+
+API_KEY = 'bebb2e257d180cee79d882f1cfc3136e'
+
+# Series IDs for Treasury yields
+series_ids = {
+    '3M': 'DTB3',
+    '2Y': 'GS2',
+    '10Y': 'GS10'
+}
+
+# API base URL
+base_url = 'https://api.stlouisfed.org/fred/series/observations'
+
+params_common = {
+    'api_key': API_KEY,
+    'file_type': 'json',
+    'observation_start': '1999-11-01',
+    'observation_end': '2025-05-05'
+}
+
+def fetch_series(series_id):
+    params = {**params_common, 'series_id': series_id}
+    response = requests.get(base_url, params=params)
+    
+    if response.status_code != 200:
+        print(f"Error {response.status_code}: {response.text}")
+        return None
+
+    data = response.json()
+    
+    if 'observations' not in data:
+        print(f"Missing 'observations' in response for {series_id}")
+        print("Response content:", data)
+        return None
+
+    df = pd.DataFrame(data['observations'])
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+
+    # Replace '.' with NaN before converting to float
+    df['value'] = pd.to_numeric(df['value'], errors='coerce')
+
+    return df[['value']].rename(columns={'value': series_id})
+
+dfs = {label: fetch_series(series_id) for label, series_id in series_ids.items()}
+
+result = pd.concat(dfs.values(), axis=1)
+result.columns = list(series_ids.keys())  # Rename columns to 3M, 2Y, 10Y
+
+result.to_csv('intrates.csv')
+
+# retrieving daily stock data from AlphaVantage
+
+API_KEY = '2C196TEUXDKCQ1LC'
+
+#XLK = tech
+#XLF = financials
+#XLU = utilities
+#XLY = consumer discretionary
+#XLP = consumer staples
+#XLE = energy
+#XLI = industrials
+#XLV = healthcare
+#XLRE = real estate (started 2015)
+#XLB = materials
+#XLC = communication services (started 2018)
+
+stocks = ['XLK', 'XLF', 'XLU','XLY','XLP','XLE','XLI','XLV','XLRE','XLB','XLC']
+base_url = 'https://www.alphavantage.co/query'
+
+stock_data = pd.DataFrame()
+
+for symbol in stocks:
+    params = {'function': 'TIME_SERIES_DAILY', 'symbol': symbol, 'apikey': API_KEY, 'outputsize': 'full'}
+
+    # Make the API request and parse the response as JSON
+    response = requests.get(base_url, params=params).json()
+
+    # Check if the response contains the daily time series data
+    if 'Time Series (Daily)' in response:
+        # Convert JSON data into a pandas DataFrame
+        df = pd.DataFrame(response['Time Series (Daily)']).T.astype(float)
+
+        # Convert index to datetime format for better manipulation
+        df.index = pd.to_datetime(df.index)
+
+        # Rename columns to more understandable labels
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+
+        # Add a new column with the stock symbol for easier identification
+        df['Symbol'] = symbol
+
+        # Concatenate data for the current stock to the main DataFrame
+        stock_data = pd.concat([stock_data, df])
+
+        # Inform user that data retrieval was successful
+        print(f"Data retrieved for {symbol}")
+    else:
+        # Handle potential errors or API rate limit issues
+        print(f"Error retrieving {symbol}: {response.get('Note', '')}")
+        # Wait before the next request to avoid rate limiting
+        time.sleep(60)
+        continue
+
+    # Brief pause to respect API rate limits (Alpha Vantage allows 5 calls/min)
+    time.sleep(12)
+
+stock_data.to_csv('indexdata.csv')
+
+
+rates_df_temp = pd.read_csv('/Users/lavin/intrates.csv')
+index_df = pd.read_csv('/Users/lavin/Downloads/indexdata.csv')
+index_df.rename(columns={index_df.columns[0]: 'date'}, inplace=True)
+
+
+# create data frames for each index
+
+stocks = ['XLK', 'XLF', 'XLU','XLY','XLP','XLE','XLI','XLV','XLB']
+
+datasets = {}
+
+for stock in stocks: 
+    datasets[stock] = index_df[index_df['Symbol'] == stock]
+    datasets[stock] = datasets[stock].iloc[::-1].reset_index(drop=True)
+
+#compute daily return
+
+rates_df = rates_df_temp
+
+for stock in stocks:
+    datasets[stock]['Return']=datasets[stock]['Close'].pct_change()
+
+rates_df = rates_df.dropna(subset='3M')
+
+rates_df = rates_df.drop(['2Y','10Y'], axis=1)
+rates_df['Difference'] = rates_df['3M'].diff()
+rates_df['Lag_1_Difference'] = rates_df['Difference'].shift(1)
+
+plt.plot(rates_df['Difference'])
+plt.show()
+
+#moving averages
+
+for stock in stocks:
+        datasets[stock]['MA_5'] =  datasets[stock]['Close'].rolling(window=5).mean()
+        datasets[stock]['MA_10'] =  datasets[stock]['Close'].rolling(window=10).mean()
+        datasets[stock]['MA_20'] = datasets[stock]['Close'].rolling(window=20).mean()
+
+# volatility on 10 day window
+
+for stock in stocks:
+    datasets[stock]['Volatility_10'] = datasets[stock]['Return'].rolling(window=10).std()
+
+# lag of return (return of previous day)
+
+for stock in stocks:
+    datasets[stock]['Lag_1_Return'] = datasets[stock]['Return'].shift(1)
+    datasets[stock].dropna(inplace = True)
+
+# target: next day return
+
+for stock in stocks:
+    datasets[stock]['Target'] = datasets[stock]['Return'].shift(-1)
+    datasets[stock].dropna(inplace = True)
+
+# LINEAR REGRESSION
+
+lr_results = {}
+
+
+for stock in stocks:
+
+    temp_df = pd.merge(datasets[stock], rates_df,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference','Return', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+   
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    lr_model = LinearRegression()
+    lr_model.fit(X_train, y_train)
+
+    lr_pred = lr_model.predict(X_test)
+    lr_mse = mean_squared_error(y_test, lr_pred)
+    lr_r2 = r2_score(y_test, lr_pred)
+
+    lr_results[stock] = {'lr_pred' : lr_pred, 'y_test' : y_test, 'lr_mse' : lr_mse, 'lr_r2' : lr_r2}
+
+    lr_coefficients = pd.Series(lr_model.coef_, index=feature_cols)
+    print(f'Coefficients Linear Regression for {stock}:, {lr_coefficients}')
+    print(f"MSE: {lr_mse:.7f}, R²: {lr_r2:.4f}")
+
+   # plt.plot(y_test.values)
+   # plt.plot(lr_pred)
+   # plt.show()
+
+
+#RIDGE REGRESSION
+
+for stock in stocks:
+    temp_df = pd.merge(datasets[stock], rates_df,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference','Return', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+
+
+    alpha_values = {'alpha': np.logspace(-4, 4, 50)}
+    ridge = Ridge()
+
+    ridge_cv = GridSearchCV(estimator=ridge, param_grid=alpha_values, cv=5, scoring='neg_mean_squared_error')
+    ridge_cv.fit(X_train, y_train)
+
+    ridge_pred = ridge_cv.predict(X_test)
+    ridge_mse = mean_squared_error(y_test, ridge_pred)
+    ridge_r2 = r2_score(y_test, ridge_pred)
+
+
+    rr_coefficients = pd.Series(ridge_cv.best_estimator_.coef_, index=feature_cols)
+    print(f'Coefficients Ridge Regression for {stock}:, {ridge_cv.best_estimator_.coef_}')
+    print(f"MSE: {ridge_mse:.7f}, R²: {ridge_r2:.4f}")
+
+
+    plt.plot(y_test.values)
+    plt.plot(ridge_pred)
+    plt.show()
+
+#LASSO REGRESSION
+
+for stock in stocks:
+    temp_df = pd.merge(datasets[stock], rates_df,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference','Return', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+
+    lasso = Lasso(max_iter=10000)
+    lasso_cv = GridSearchCV(estimator=lasso, param_grid=alpha_values, cv=5, scoring='neg_mean_squared_error')
+    lasso_cv.fit(X_train, y_train)
+
+    lasso_pred = lasso_cv.predict(X_test)
+    lasso_mse = mean_squared_error(y_test, lasso_pred)
+    lasso_r2 = r2_score(y_test, lasso_pred)
+
+    lasso_coefficients = pd.Series(lasso_cv.best_estimator_.coef_, index=feature_cols)
+    print(f'Coefficients Lasso Regression for {stock}:, {lasso_cv.best_estimator_.coef_}')
+    print(f"MSE: {lasso_mse:.7f}, R²: {lasso_r2:.4f}")
+
+
+    plt.plot(y_test.values)
+    plt.plot(lasso_pred)
+    plt.show()
+
+
+# 2 YEAR RATES
+
+#downloading monthly data with yahoofinance. ran out of alphavantage downloads with my api key :(
+
+# List of stock index ETFs
+stocks = ['XLK', 'XLF', 'XLU', 'XLY', 'XLP', 'XLE', 'XLI', 'XLV', 'XLB']
+
+import yfinance as yf
+
+tickers = ['XLK', 'XLF', 'XLU', 'XLY', 'XLP', 'XLE', 'XLI', 'XLV', 'XLB']
+
+raw_data = yf.download(
+    tickers=tickers,
+    start="1999-11-01",
+    end="2025-04-30",
+    interval="1mo",
+    group_by='ticker',
+    auto_adjust=True
+)
+# Optional: extract just the adjusted close prices for all tickers
+adj_close = pd.concat([raw_data[ticker]['Close'] for ticker in tickers], axis=1)
+adj_close.columns = tickers
+
+adj_close.to_csv('yfinance_monthly.csv')
+
+monthly_datasets = {}
+
+for stock in stocks: 
+    monthly_datasets[stock] = adj_close[stock]
+    monthly_datasets[stock] = monthly_datasets[stock].to_frame()
+    monthly_datasets[stock] = monthly_datasets[stock].iloc[2:].reset_index()
+    monthly_datasets[stock].columns.values[0] = 'date'
+    monthly_datasets[stock]['Return']=monthly_datasets[stock][stock].pct_change()
+
+rates_df_2y = rates_df_temp.drop(['3M','10Y'], axis=1).dropna().reset_index(drop=True)
+rates_df_2y = rates_df_2y.iloc[2:].reset_index(drop=True)
+rates_df_2y['Difference'] = rates_df_2y['2Y'].diff()
+rates_df_2y['Lag_1_Difference'] = rates_df_2y['Difference'].shift(1)
+rates_df_2y['date'] = pd.to_datetime(rates_df_2y['date'])
+
+#moving averages
+
+for stock in stocks:
+        monthly_datasets[stock]['MA_5'] =  monthly_datasets[stock][stock].rolling(window=5).mean()
+        monthly_datasets[stock]['MA_10'] =  monthly_datasets[stock][stock].rolling(window=10).mean()
+        monthly_datasets[stock]['MA_20'] = monthly_datasets[stock][stock].rolling(window=20).mean()
+
+# volatility on 10 day window
+
+for stock in stocks:
+    monthly_datasets[stock]['Volatility_10'] = datasets[stock]['Return'].rolling(window=10).std()
+
+# lag of return (return of previous day)
+
+for stock in stocks:
+    monthly_datasets[stock]['Lag_1_Return'] = monthly_datasets[stock]['Return'].shift(1)
+    monthly_datasets[stock].dropna(inplace = True)
+
+# target: next day return
+
+for stock in stocks:
+    monthly_datasets[stock]['Target'] = monthly_datasets[stock]['Return'].shift(-1)
+    monthly_datasets[stock].dropna(inplace = True)
+
+
+# LINEAR REGRESSION
+lr_results_2y = {}
+
+for stock in stocks:
+    temp_df = pd.merge(monthly_datasets[stock], rates_df_2y,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+
+   
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    lr_model = LinearRegression()
+    lr_model.fit(X_train, y_train)
+
+    lr_pred = lr_model.predict(X_test)
+    lr_mse = mean_squared_error(y_test, lr_pred)
+    lr_r2 = r2_score(y_test, lr_pred)
+
+    lr_results_2y[stock] = {'lr_pred' : lr_pred, 'y_test' : y_test}
+    lr_coefficients = pd.Series(lr_model.coef_, index=feature_cols)
+    print(f'Coefficients Linear Regression for {stock}:, {lr_coefficients}')
+    print(f"MSE: {lr_mse:.7f}, R²: {lr_r2:.4f}")
+
+    #plt.plot(y_test.values)
+    #plt.plot(lr_pred)
+    #plt.show()
+
+
+#RIDGE REGRESSION
+
+rr_statistics_2y = {}
+
+for stock in stocks:
+    temp_df = pd.merge(monthly_datasets[stock], rates_df_2y,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+    alpha_values = {'alpha': np.logspace(-4, 4, 50)}
+    ridge = Ridge()
+
+    ridge_cv = GridSearchCV(estimator=ridge, param_grid=alpha_values, cv=5, scoring='neg_mean_squared_error')
+    ridge_cv.fit(X_train, y_train)
+
+    ridge_pred = ridge_cv.predict(X_test)
+    ridge_mse = mean_squared_error(y_test, ridge_pred)
+    ridge_r2 = r2_score(y_test, ridge_pred)
+
+    rr_coefficients = pd.Series(ridge_cv.best_estimator_.coef_, index=feature_cols)
+    print(f'Coefficients Ridge Regression for {stock}:, {ridge_cv.best_estimator_.coef_}')
+    print(f"MSE: {ridge_mse:.7f}, R²: {ridge_r2:.4f}")
+
+    #plt.plot(y_test.values)
+    #plt.plot(ridge_pred)
+   # plt.show()
+
+# Lasso regression
+
+lsr_statistics_2y = {}
+
+for stock in stocks:
+    temp_df = pd.merge(monthly_datasets[stock], rates_df_2y,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+
+    lasso = Lasso(max_iter=10000)
+    lasso_cv = GridSearchCV(estimator=lasso, param_grid=alpha_values, cv=5, scoring='neg_mean_squared_error')
+    lasso_cv.fit(X_train, y_train)
+
+    lasso_pred = lasso_cv.predict(X_test)
+    lasso_mse = mean_squared_error(y_test, lasso_pred)
+    lasso_r2 = r2_score(y_test, lasso_pred)
+
+    lasso_coefficients = pd.Series(lasso_cv.best_estimator_.coef_, index=feature_cols)
+    print(f'Coefficients Lasso Regression for {stock}:, {lasso_cv.best_estimator_.coef_}')
+    print(f"MSE: {lasso_mse:.7f}, R²: {lasso_r2:.4f}")
+
+
+   # plt.plot(y_test.values)
+   # plt.plot(lasso_pred)
+   # plt.show()
+
+# 10 YEAR INT RATES
+
+rates_df_10y = rates_df_temp.drop(['3M','2Y'], axis=1).dropna().reset_index(drop=True)
+rates_df_10y = rates_df_10y.iloc[2:].reset_index(drop=True)
+rates_df_10y['Difference'] = rates_df_10y['10Y'].diff()
+rates_df_10y['Lag_1_Difference'] = rates_df_10y['Difference'].shift(1)
+rates_df_10y['date'] = pd.to_datetime(rates_df_2y['date'])
+
+
+# LINEAR REGRESSION
+
+lr_results_10y = {}
+
+for stock in stocks:
+    temp_df = pd.merge(monthly_datasets[stock], rates_df_10y, left_index=True, right_index=True)
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference', 'MA_5', 'MA_10', 'MA_20', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+   
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    lr_model = LinearRegression()
+    lr_model.fit(X_train, y_train)
+
+    lr_pred = lr_model.predict(X_test)
+    lr_mse = mean_squared_error(y_test, lr_pred)
+    lr_r2 = r2_score(y_test, lr_pred)
+
+    lr_results_10y[stock] = {'lr_pred' : lr_pred, 'y_test' : y_test, 'lr_mse' : lr_mse, 'lr_r2' : lr_r2}
+    lr_coefficients = pd.Series(lr_model.coef_, index=feature_cols)
+    print(f'Coefficients Linear Regression for {stock}:, {lr_coefficients}')
+    print(f"MSE: {lr_mse:.7f}, R²: {lr_r2:.4f}")
+
+    plt.plot(y_test.values)
+    plt.plot(lr_pred)
+    plt.show()
+
+
+# ridge and lasso
+
+#YEARLY STOCK DATA!
+
+tickers = ['XLK', 'XLF', 'XLU', 'XLY', 'XLP', 'XLE', 'XLI', 'XLV', 'XLRE', 'XLB', 'VNQ']
+
+data = yf.download(tickers, start='2003-12-31', end='2024-12-31', auto_adjust=True)['Close']
+
+# Resample to yearly frequency (e.g., last trading day of each year)
+data_yearly = data.resample('Y').last()
+
+print(data_yearly.head())
+
+yearly_datasets = {}
+
+# Loop through each stock to create the yearly datasets
+for stock in stocks:
+    # Resample data to yearly and calculate returns
+    yearly_datasets[stock] = data_yearly[stock]
+    yearly_datasets[stock] =yearly_datasets[stock].to_frame()
+    yearly_datasets[stock]['Return'] = yearly_datasets[stock].pct_change()
+    yearly_datasets[stock] = yearly_datasets[stock].reset_index()
+    yearly_datasets[stock] = yearly_datasets[stock].rename(columns = {'Date' : 'date'})
+
+#yearly int rate data
+
+rates_df_temp['date'] = pd.to_datetime(rates_df_temp['date'])
+rates_df_temp = rates_df_temp[rates_df_temp['date'].dt.is_month_end]
+rates_df_temp.reset_index(drop=True, inplace=True)
+print(rates_df_temp.head())
+
+#3 mo int rates
+
+rates_df_3m = rates_df_temp.drop(['2Y','10Y'], axis=1).dropna().reset_index(drop=True)
+rates_df_3m = rates_df_3m.iloc[2:].reset_index(drop=True)
+rates_df_3m['Difference'] = rates_df_3m['3M'].diff()
+rates_df_3m['Lag_1_Difference'] = rates_df_3m['Difference'].shift(1)
+rates_df_3m['date'] = pd.to_datetime(rates_df_3m['date'])
+
+#moving averages
+
+stocks = ['XLK', 'XLF', 'XLU', 'XLY', 'XLP', 'XLE', 'XLI', 'XLV', 'XLRE', 'XLB', 'VNQ']
+
+for stock in stocks:
+        yearly_datasets[stock]['MA_5'] =  yearly_datasets[stock][stock].rolling(window=5).mean()
+
+# volatility on 10 day window
+
+for stock in stocks:
+    yearly_datasets[stock]['Volatility_10'] = yearly_datasets[stock]['Return'].rolling(window=10).std()
+
+yearly_datasets['XLK']
+# lag of return (return of previous day)
+
+for stock in stocks:
+    yearly_datasets[stock]['Lag_1_Return'] = yearly_datasets[stock]['Return'].shift(1)
+
+# target: next day return
+
+for stock in stocks:
+    yearly_datasets[stock]['Target'] = yearly_datasets[stock]['Return'].shift(-1)
+    yearly_datasets[stock].dropna(inplace = True)
+
+lr_results_2y = {}
+
+for stock in stocks:
+    temp_df = pd.merge(yearly_datasets[stock], rates_df_3m,on = 'date', how = 'inner')
+    temp_df = temp_df.dropna(subset=['Lag_1_Difference'], how = 'any')
+    feature_cols = ['Lag_1_Difference', 'MA_5', 'Volatility_10', 'Lag_1_Return']
+    X = temp_df[feature_cols]
+    y = temp_df['Target']
+
+   
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    lr_model = LinearRegression()
+    lr_model.fit(X_train, y_train)
+
+    lr_pred = lr_model.predict(X_test)
+    lr_mse = mean_squared_error(y_test, lr_pred)
+    lr_r2 = r2_score(y_test, lr_pred)
+
+    lr_results_2y[stock] = {'lr_pred' : lr_pred, 'y_test' : y_test}
+    lr_coefficients = pd.Series(lr_model.coef_, index=feature_cols)
+    print(f'Coefficients Linear Regression for {stock}:, {lr_coefficients}')
+    print(f"MSE: {lr_mse:.7f}, R²: {lr_r2:.4f}")
+
+    plt.plot(y_test.values)
+    plt.plot(lr_pred)
+    plt.show()
